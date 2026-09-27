@@ -920,11 +920,25 @@ void LightGridInjectionCS(
 	{
 		const uint GridIndex = (GridCoordinate.z * CulledGridSize.y + GridCoordinate.y) * CulledGridSize.x + GridCoordinate.x + ViewGridCellOffset;
 
-// SelShader: CULL_LIGHTS 0 = pass ALL lights to every cell (no culling). The ES3.1 Vulkan cull
-// stage delivers zero lights into cells (see probes); with ~15 toon lights, uncapped passthrough
-// is cheap and bypasses the broken stage entirely. Set back to 1 to restore normal culling.
-#define CULL_LIGHTS 0
-#if CULL_LIGHTS
+		// SelShader: the ES3.1 Vulkan cull stage delivers zero lights into cells (shader probes:
+		// CS runs, NumLocalLights=15, but LightViewSpacePositionAndRadius reads as zeros and all
+		// cull math yields empty cells) whereas the same stage works on SM5. Root cause never found
+		// -- HZB validity, wave-op linked lists, async compute and the CPU-side view-space upload
+		// were all verified correct. As a scoped workaround, bypass the per-cell cull tests on the
+		// ES3.1 feature level ONLY and pass all lights through to every cell (the headers still
+		// advertise the real count so MaxCulledLightsPerCell truncation stays consistent). SM5 and
+		// other feature levels keep the full culling path.
+		//
+		// COST: every local light is handed to every grid cell in view, including lights behind the
+		// camera. Per-pixel IsLightVisible() and GetLocalLightAttenuation() in the base pass still
+		// reject lights by radius, so correctness holds, but per-cell GPU cost scales with light
+		// count. Acceptable for a toon scene with ~15 local lights; revisit if a scene uses many.
+#if FEATURE_LEVEL == FEATURE_LEVEL_ES3_1
+#define SEL_CULL_LIGHTS 0
+#else
+#define SEL_CULL_LIGHTS 1
+#endif
+#if SEL_CULL_LIGHTS
 
 		float MinTileZ = ComputeCellNearViewDepthFromZSlice(GridCoordinate.z + 0, LightGridZSliceScale);
 		float MaxTileZ = ComputeCellNearViewDepthFromZSlice(GridCoordinate.z + 1, LightGridZSliceScale);
@@ -991,7 +1005,7 @@ void LightGridInjectionCS(
 			CullReflectionCaptures_SingleThread(GridIndex, CellBounds, ParentGridIndex);
 		}
 
-#else // !CULL_LIGHTS
+#else // !SEL_CULL_LIGHTS
 		LOOP
 		for (uint LocalLightIndex = 0; LocalLightIndex < NumLocalLights; LocalLightIndex++)
 		{
@@ -1018,7 +1032,7 @@ void LightGridInjectionCS(
 		const uint NumVisibleReflectionCaptures = min(NumReflectionCaptures, MaxCulledLightsPerCell);
 		RWNumCulledLightsGrid[(NumGridCells + GridIndex) * NUM_CULLED_LIGHTS_GRID_STRIDE + 0] = NumVisibleReflectionCaptures;
 		RWNumCulledLightsGrid[(NumGridCells + GridIndex) * NUM_CULLED_LIGHTS_GRID_STRIDE + 1] = (NumGridCells + GridIndex) * MaxCulledLightsPerCell;
-#endif // !CULL_LIGHTS
+#endif // !SEL_CULL_LIGHTS
 	}
 }
 

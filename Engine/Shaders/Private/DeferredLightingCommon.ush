@@ -259,7 +259,11 @@ float GetLocalLightAttenuation(
 	{
 		LightMask = Square( saturate( 1 - Square( DistanceSqr * Square(LightData.InvRadius) ) ) );
 		// This extra attenuation has been added for supporting existing translucent shading model and merged local lights on mobile
-		#if SHADING_PATH_MOBILE && TRANSLUCENCY_SH_LIGHTING
+		// SelShader: this 1/(d^2+1) term is in RAW cm^2, so it evaluates to ~1e-5 at real light
+		// distances. It is currently unreachable for CLEAR_COAT (TRANSLUCENCY_SH_LIGHTING excludes
+		// it), but if that ever changes the SelShader band would collapse to black again, because
+		// LightMask is the SelShader post-band intensity. Do not enable for CLEAR_COAT.
+	#if SHADING_PATH_MOBILE && TRANSLUCENCY_SH_LIGHTING
 		if (!LightData.bRectLight)
 		{ 
 			LightMask *= 1.0f / (DistanceSqr + 1.0f);
@@ -430,7 +434,10 @@ FLightAccumulator AccumulateDynamicLighting(
 	float3 LightmapInfo = GBuffer.PrecomputedShadowFactors.rgb;
 	float ShadowRange = GBuffer.Metallic; 
 	float InvShadowRange = rcp(max(ShadowRange, 1e-6));
-	float3 LightmapFactor = any(LightmapInfo > 0) ? LightmapInfo : 1;
+	// SelShader: per-channel fallback, not `any()`. any() is a scalar test -- a single zero channel
+	// kept the (zero) value and killed the BaseColour/ShadowColour tint on the other two channels.
+	// DXC rejects a vector condition in `?:`, so express f(v) = v > 0 ? v : 1 as 1 + step*(v-1).
+	float3 LightmapFactor = 1 + step(1e-8, LightmapInfo) * (LightmapInfo - 1);
 	float3 PixelBaseColour = GBuffer.BaseColor.rgb * LightmapFactor;
 	float3 PixelShadowColour = GBuffer.CustomData.rgb * LightmapFactor;
 
@@ -495,6 +502,28 @@ FLightAccumulator AccumulateDynamicLighting(
 		#endif
 		}
 
+		// SelShader (ES3.1 forward): mobile forward has no capsule light, so SelShaderBxDF always
+		// receives AreaLight.Falloff == 1 (EvaluateBxDF -> InitAreaLight, AreaLightCommon.ush:60).
+		// The 5.8 shared path instead received AreaLight.Falloff = rcp(DistSqr + 1) in RAW cm^2
+		// (CapsuleLightIntegrate.ush:56, DistBiasSqr = 1 from GetCapsule) -- but ONLY for
+		// inverse-squared lights, because CapsuleLightIntegrate.ush:70 then does
+		//   AreaLight.Falloff = bInverseSquared ? AreaLight.Falloff : 1;
+		// and bInverseSquared is false for directional lights and for any light with a non-zero
+		// Falloff Exponent. Reproduce that exact conditional, in the same position 5.8 applies it
+		// (inside the BxDF, before DiffuseScale), so the band matches desktop line for line.
+		//
+		// Do NOT drop the conditional: applying this to a directional light would multiply it by
+		// rcp(1+1) = 0.5, because ToLight is the unit light direction for directional.
+		//
+		// NOTE for authoring: this term is 1/(d^2+1) in cm^2, so an inverse-squared point/spot
+		// light needs ShadowRange (the Metallic pin) around 1e-4 to register at any real distance.
+		// Toon point and VFX lights should use a non-zero Falloff Exponent, which makes
+		// bInverseSquared false and the term 1 -- matching 5.8 exactly.
+		if (LightData.bInverseSquared)
+		{
+			Lighting.Diffuse *= rcp(dot(ToLight, ToLight) + 1.0f);
+		}
+
 		Lighting.Specular *= LightData.SpecularScale;
 		Lighting.Diffuse *= LightData.DiffuseScale;
 
@@ -502,23 +531,20 @@ FLightAccumulator AccumulateDynamicLighting(
 		{
 			if(LightData.bRadialLight || LightData.bSpotLight || LightData.bRectLight)
 			{
-				// SelShader: byte-identical threshold input to the desktop branch. Desktop's capsule
-				// integration bakes the physical falloff rcp(DistSqr + DistBiasSqr=1) (RAW world units,
-				// cm^2) into Lighting.Diffuse; mobile SelShaderBxDF has AreaLight.Falloff == 1 (no decay),
-				// so without this term the FinalLightMask threshold stays exceeded across the whole light
-				// radius -> the entire radius blows out bright while SM5 shows a tight pool. Multiply the
-				// threshold input by exactly the desktop falloff, rcp(DistanceSqr + 1) (NOT radius-
-				// normalized), so the pool size and brightness match SM5 for the same light.
-				float DistanceSqr = dot(ToLight, ToLight);
-				float DistanceFalloff = rcp(DistanceSqr + 1.0f);
-				half FinalLightMask = Luminance(saturate(lerp(0, InvShadowRange, saturate(Lighting.Diffuse * LightMask * DistanceFalloff))));
+				// SelShader: a point light must give a HARD cel circle, not a smooth 1/d^2 gradient.
+				// FinalLightMask was a linear ramp from 0 to InvShadowRange, so the pool intensity
+				// faded gradually and the circle edge washed out near the rim. Quantize the pool
+				// edge with the same ShadowRange band width used for the shadow terminator below,
+				// so the circle is as sharp as the shadow edge.
+				float SelPool = Luminance(saturate(InvShadowRange * saturate(Lighting.Diffuse * LightMask)));
+				float SelPoolEdge = smoothstep(0.5 - ShadowRange, 0.5 + ShadowRange, SelPool);
 				float3 DeskRadialBlend = lerp(PixelShadowColour, PixelBaseColour, smoothstep(0.5 - ShadowRange, 0.5 + ShadowRange, Shadow.SurfaceShadow));
-				LightAccumulator.TotalLightDiffuse = DeskRadialBlend * LightData.Color * FinalLightMask;
+				LightAccumulator.TotalLightDiffuse = DeskRadialBlend * LightData.Color * SelPoolEdge;
 				LightAccumulator.TotalLight = LightAccumulator.TotalLightDiffuse;
 				LightAccumulator.TotalLightDiffuse = lerp(LightAccumulator.TotalLightDiffuse, LightAccumulator.TotalLightDiffuse * GBuffer.BaseColor, 0.2);
 				LightAccumulator.TotalLight = lerp(LightAccumulator.TotalLight, LightAccumulator.TotalLight * GBuffer.BaseColor, 0.2);
-				LightAccumulator.TotalLightDiffuse += PixelShadowColour * LightData.Color * saturate(( 1 - LightData.SpecularScale)) * FinalLightMask * (1 - Shadow.SurfaceShadow);
-				LightAccumulator.TotalLight += PixelShadowColour * LightData.Color * saturate(( 1 - LightData.SpecularScale)) * FinalLightMask * (1 - Shadow.SurfaceShadow);
+				LightAccumulator.TotalLightDiffuse += PixelShadowColour * LightData.Color * saturate(( 1 - LightData.SpecularScale)) * SelPoolEdge * (1 - Shadow.SurfaceShadow);
+				LightAccumulator.TotalLight += PixelShadowColour * LightData.Color * saturate(( 1 - LightData.SpecularScale)) * SelPoolEdge * (1 - Shadow.SurfaceShadow);
 			}
 			else
 			{
@@ -584,9 +610,9 @@ FLightAccumulator AccumulateDynamicLighting(
 				#endif
 			}
 
-			Lighting.Specular *= LightData.SpecularScale;
-			Lighting.Diffuse  *= LightData.DiffuseScale;
-			Lighting.Transmission *= LightData.DiffuseScale;
+		Lighting.Specular *= LightData.SpecularScale;
+		Lighting.Diffuse  *= LightData.DiffuseScale;
+		Lighting.Transmission *= LightData.DiffuseScale;
 
 		#if USE_LIGHT_FUNCTION_ATLAS
 			MaskedLightColor *= GetLocalLightFunctionCommon(TranslatedWorldPosition, LightData.LightFunctionAtlasLightIndex);
@@ -596,14 +622,20 @@ FLightAccumulator AccumulateDynamicLighting(
 			{
 				if(LightData.bRadialLight || LightData.bSpotLight || LightData.bRectLight)
 				{
-					half FinalLightMask = Luminance(saturate(lerp(0, InvShadowRange, saturate(Lighting.Diffuse * LightMask ))));
+					// SelShader: a point light must give a HARD cel circle, not a smooth 1/d^2 gradient.
+					// FinalLightMask was a linear ramp from 0 to InvShadowRange, so the pool intensity
+					// faded gradually and the circle edge washed out near the rim. Quantize the pool
+					// edge with the same ShadowRange band width used for the shadow terminator below,
+					// so the circle is as sharp as the shadow edge.
+					float SelPool = Luminance(saturate(InvShadowRange * saturate(Lighting.Diffuse * LightMask)));
+					float SelPoolEdge = smoothstep(0.5 - ShadowRange, 0.5 + ShadowRange, SelPool);
 					float3 DeskRadialBlend = lerp(PixelShadowColour, PixelBaseColour, smoothstep(0.5 - ShadowRange, 0.5 + ShadowRange, Shadow.SurfaceShadow));
-					LightAccumulator.TotalLightDiffuse = DeskRadialBlend * LightData.Color * FinalLightMask;
+					LightAccumulator.TotalLightDiffuse = DeskRadialBlend * LightData.Color * SelPoolEdge;
 					LightAccumulator.TotalLight = LightAccumulator.TotalLightDiffuse;
 					LightAccumulator.TotalLightDiffuse = lerp(LightAccumulator.TotalLightDiffuse, LightAccumulator.TotalLightDiffuse * GBuffer.BaseColor, 0.2);
 					LightAccumulator.TotalLight = lerp(LightAccumulator.TotalLight, LightAccumulator.TotalLight * GBuffer.BaseColor, 0.2);
-					LightAccumulator.TotalLightDiffuse += PixelShadowColour * LightData.Color * saturate(( 1 - LightData.SpecularScale)) * FinalLightMask * (1 - Shadow.SurfaceShadow);
-					LightAccumulator.TotalLight += PixelShadowColour * LightData.Color * saturate(( 1 - LightData.SpecularScale)) * FinalLightMask * (1 - Shadow.SurfaceShadow);
+					LightAccumulator.TotalLightDiffuse += PixelShadowColour * LightData.Color * saturate(( 1 - LightData.SpecularScale)) * SelPoolEdge * (1 - Shadow.SurfaceShadow);
+					LightAccumulator.TotalLight += PixelShadowColour * LightData.Color * saturate(( 1 - LightData.SpecularScale)) * SelPoolEdge * (1 - Shadow.SurfaceShadow);
 				}
 				else
 				{
