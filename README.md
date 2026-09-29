@@ -26,9 +26,29 @@ What this repo adds on top:
 2. **ES3.1 parity** — the mobile radial branch uses the desktop math verbatim, plus a
    `rcp(DistSqr + 1)` compensation because mobile's `SelShaderBxDF` lacks the capsule path's
    baked-in physical falloff. Verified pixel-identical band edges vs SM5.
-3. **Mobile local-light delivery fix** — the UE6-reworked light-grid cull stage can deliver
-   zero lights into cells on `VULKAN_PCES3_1`; this build ships the engine's own
-   `CULL_LIGHTS 0` passthrough as the workaround (`LightGridInjection.usf`).
+3. **Mobile local-light delivery fix (engine-side)** — the UE6-reworked light-grid cull
+   stage delivered zero lights into cells on `VULKAN_PCES3_1`. Root cause: the
+   **specialization-constant variant** of `LightGridInjectionCS` misreads its StructuredBuffer
+   SRVs on that platform. Fix (in the engine tree, `LightGridInjection.cpp`):
+
+   ```cpp
+   static inline bool UseSpecializationConstants(EShaderPlatform ShaderPlatform)
+   {
+       // Sel: the spec-const variant of LightGridInjectionCS misbehaves on VULKAN_PCES3_1
+       // (StructuredBuffer SRV reads return zeros -> culled cells come out empty).
+       if (ShaderPlatform == SP_VULKAN_PCES3_1)
+       {
+           return false;
+       }
+       return FDataDrivenShaderPlatformInfo::GetSupportsSpecializationConstants(ShaderPlatform) &&
+           CVarLightGridInjectionUseSpecializationConstants.GetValueOnAnyThread() == 1;
+   }
+   ```
+
+   With that gate, **stock culling works** on ES3.1 and `LightGridInjection.usf` is
+   unmodified (`CULL_LIGHTS 1`). Do NOT use the old `CULL_LIGHTS 0` passthrough: it writes
+   raw grid indices that resolve to the directional light's buffer slot, shading a phantom
+   point light at the world origin.
 
 ## How it works (material contract)
 
@@ -65,14 +85,16 @@ Drop-in replacements for `Engine/Shaders/Private/` files, based on **UE 6.0**:
 | `MobileBasePassPixelShader.usf` | Same carries for the mobile base pass |
 | `MobileLightingCommon.ush` | Restored stock UE6 signatures (mobile forward entry point) |
 | `DBufferDecalShared.ush` | Decal ShadowColour via Metallic/Specular/Roughness pins |
-| `LightGridInjection.usf` | `CULL_LIGHTS 0` — all lights delivered to every cell (ES3.1 grid workaround) |
+| `LightGridInjection.usf` | **Stock / unmodified** (`CULL_LIGHTS 1`). Kept only so the folder mirrors the engine tree; the ES3.1 fix is the engine-side spec-const gate described above |
 
 ## Installation (source build)
 
 1. Copy `Engine/Shaders/Private/*` over your UE6 source engine's `Engine/Shaders/Private/`.
-2. Rebuild (shader changes hot-reload in-editor via `recompileshaders changed`, the
-   `CULL_LIGHTS` change triggers a global shader rebuild).
-3. Set your material's Shading Model to **Clear Coat** and drive the pins as above.
+2. Rebuild (shader changes hot-reload in-editor via `recompileshaders changed`).
+3. Apply the `UseSpecializationConstants` gate from section 3 above to
+   `Engine/Source/Runtime/Renderer/Private/LightGridInjection.cpp` and rebuild the editor —
+   without it, local lights will not reach grid cells on VULKAN_PCES3_1.
+4. Set your material's Shading Model to **Clear Coat** and drive the pins as above.
 
 > These files are for a **UE 6.0** engine tree. Do **not** paste them onto other engine
 > versions wholesale — signatures differ between versions and you'll get shader compile
@@ -80,8 +102,8 @@ Drop-in replacements for `Engine/Shaders/Private/` files, based on **UE 6.0**:
 
 ## Known limitations
 
-- The `CULL_LIGHTS 0` workaround shades every light in every cell — fine for ~15–20 lights;
-  if you need large light counts on ES3.1, the underlying grid-cull bug needs a real fix.
+- ES3.1 (VULKAN_PCES3_1) requires the engine-side `UseSpecializationConstants` gate
+  (see section 3); a shader-only install cannot fix the light grid on that platform.
 - Exponent-falloff lights: the `rcp(d^2+1)` compensation matches the desktop *inverse-square*
   integration; with `bInverseSquared=false` lights, SM5 itself uses Falloff=1, so if you want
   strict per-falloff matching, gate the compensation on `LightData.bInverseSquared`.
